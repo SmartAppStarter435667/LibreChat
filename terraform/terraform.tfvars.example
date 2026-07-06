@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars for LOCAL testing only (e.g. `terraform plan` on
+# your laptop). Never commit the real terraform.tfvars — it's already
+# excluded by terraform/.gitignore.
+#
+# The GitHub Actions pipeline does NOT read this file. It supplies the same
+# values as TF_VAR_* environment variables built from GitHub Secrets, which
+# scripts/oci-setup-secrets.sh sets up for you automatically. You only need
+# this file if you also want to run `terraform plan`/`apply` by hand.
+
+oci_tenancy_ocid     = "ocid1.tenancy.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+oci_user_ocid        = "ocid1.user.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+oci_fingerprint      = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+oci_region           = "ap-tokyo-1"
+oci_compartment_ocid = "ocid1.tenancy.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" # root compartment
+
+# Read straight from your API signing key file instead of pasting the PEM:
+oci_private_key = file("~/.oci/oci_api_key.pem")
+
+ssh_public_key   = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExample you@example.com"
+ssh_allowed_cidr = "203.0.113.10/32" # replace with your own IP/32

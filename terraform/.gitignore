@@ -1,0 +1,16 @@
+# Scoped to terraform/ only — safe to add even if the parent repo (e.g. a
+# LibreChat fork) already has its own root .gitignore.
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Real variable values — keep only terraform.tfvars.example in git
+*.tfvars
+*.tfvars.json
+!terraform.tfvars.example
