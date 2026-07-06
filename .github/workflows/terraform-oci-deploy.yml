@@ -1,0 +1,181 @@
+name: Deploy LibreChat to OCI (Terraform)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-oci-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action'
+        type: choice
+        options: [apply, destroy]
+        default: apply
+
+permissions:
+  contents: read
+
+env:
+  TF_VAR_oci_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+  TF_VAR_oci_user_ocid: ${{ secrets.OCI_USER_OCID }}
+  TF_VAR_oci_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+  TF_VAR_oci_private_key: ${{ secrets.OCI_PRIVATE_KEY }}
+  TF_VAR_oci_region: ${{ secrets.OCI_REGION }}
+  TF_VAR_oci_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+  TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+  TF_VAR_ssh_allowed_cidr: ${{ secrets.SSH_ALLOWED_CIDR }}
+
+jobs:
+  terraform:
+    name: Provision OCI infrastructure
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    outputs:
+      instance_public_ip: ${{ steps.read_ip.outputs.ip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=librechat/terraform.tfstate" \
+            -backend-config="region=${{ secrets.OCI_REGION }}" \
+            -backend-config="endpoint=https://${{ secrets.TF_STATE_NAMESPACE }}.compat.objectstorage.${{ secrets.OCI_REGION }}.oraclecloud.com" \
+            -backend-config="access_key=${{ secrets.TF_STATE_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.TF_STATE_SECRET_KEY }}" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="force_path_style=true"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: github.event_name == 'push' || github.event.inputs.action == 'apply'
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: github.event_name == 'push' || github.event.inputs.action == 'apply'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        run: terraform destroy -auto-approve
+
+      - name: Read instance IP
+        id: read_ip
+        if: github.event_name == 'push' || github.event.inputs.action == 'apply'
+        run: echo "ip=$(terraform output -raw instance_public_ip)" >> "$GITHUB_OUTPUT"
+
+  deploy-app:
+    name: Deploy LibreChat onto the instance
+    needs: terraform
+    if: needs.terraform.outputs.instance_public_ip != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ needs.terraform.outputs.instance_public_ip }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Wait for SSH and cloud-init to finish
+        env:
+          HOST: ${{ needs.terraform.outputs.instance_public_ip }}
+        run: |
+          for i in $(seq 1 30); do
+            ssh -i ~/.ssh/id_ed25519 -o ConnectTimeout=10 ubuntu@"$HOST" true && break
+            echo "Waiting for SSH... ($i/30)"
+            sleep 10
+          done
+          ssh -i ~/.ssh/id_ed25519 ubuntu@"$HOST" 'sudo cloud-init status --wait'
+
+      - name: Determine public URL
+        id: url
+        run: |
+          if [ -n "${{ secrets.DOMAIN_NAME }}" ]; then
+            echo "base_url=https://${{ secrets.DOMAIN_NAME }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_url=http://${{ needs.terraform.outputs.instance_public_ip }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare LibreChat config files
+        run: |
+          [ -f librechat.yaml ] || cp librechat.example.yaml librechat.yaml
+          cat > .env <<'ENVEOF'
+          HOST=0.0.0.0
+          PORT=3080
+          APP_TITLE=LibreChat
+          DOMAIN_CLIENT=${{ steps.url.outputs.base_url }}
+          DOMAIN_SERVER=${{ steps.url.outputs.base_url }}
+          NO_INDEX=true
+          TRUST_PROXY=1
+          MONGO_URI=mongodb://mongodb:27017/LibreChat
+          JWT_SECRET=${{ secrets.LIBRECHAT_JWT_SECRET }}
+          JWT_REFRESH_SECRET=${{ secrets.LIBRECHAT_JWT_REFRESH_SECRET }}
+          SESSION_EXPIRY=1000 * 60 * 15
+          REFRESH_TOKEN_EXPIRY=(1000 * 60 * 60 * 24) * 7
+          CREDS_KEY=${{ secrets.LIBRECHAT_CREDS_KEY }}
+          CREDS_IV=${{ secrets.LIBRECHAT_CREDS_IV }}
+          SEARCH=true
+          MEILI_NO_ANALYTICS=true
+          MEILI_HOST=http://meilisearch:7700
+          MEILI_MASTER_KEY=${{ secrets.LIBRECHAT_MEILI_MASTER_KEY }}
+          RAG_PORT=8000
+          ALLOW_EMAIL_LOGIN=true
+          ALLOW_REGISTRATION=true
+          ALLOW_SOCIAL_LOGIN=false
+          ALLOW_PASSWORD_RESET=false
+          ALLOW_UNVERIFIED_EMAIL_LOGIN=true
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY || 'user_provided' }}
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY || 'user_provided' }}
+          GOOGLE_KEY=${{ secrets.GOOGLE_KEY || 'user_provided' }}
+          ENVEOF
+
+      - name: Copy files to the server
+        env:
+          HOST: ${{ needs.terraform.outputs.instance_public_ip }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ubuntu@"$HOST" 'mkdir -p /opt/librechat/client'
+          scp -i ~/.ssh/id_ed25519 deploy-compose.yml ubuntu@"$HOST":/opt/librechat/deploy-compose.yml
+          scp -i ~/.ssh/id_ed25519 .env ubuntu@"$HOST":/opt/librechat/.env
+          scp -i ~/.ssh/id_ed25519 librechat.yaml ubuntu@"$HOST":/opt/librechat/librechat.yaml
+          scp -i ~/.ssh/id_ed25519 client/nginx.conf ubuntu@"$HOST":/opt/librechat/client/nginx.conf
+
+      - name: Start LibreChat
+        env:
+          HOST: ${{ needs.terraform.outputs.instance_public_ip }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ubuntu@"$HOST" '
+            cd /opt/librechat &&
+            chmod 600 .env &&
+            docker compose -f deploy-compose.yml pull &&
+            docker compose -f deploy-compose.yml up -d
+          '
+
+      - name: Wait for LibreChat to respond
+        env:
+          HOST: ${{ needs.terraform.outputs.instance_public_ip }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "http://$HOST"; then
+              echo "LibreChat is up: http://$HOST"
+              exit 0
+            fi
+            echo "Waiting for LibreChat to come up... ($i/30)"
+            sleep 15
+          done
+          echo "Did not respond in time. Check logs with:" >&2
+          echo "  ssh ubuntu@$HOST 'cd /opt/librechat && docker compose -f deploy-compose.yml logs'" >&2
+          exit 1

@@ -1,0 +1,119 @@
+name: Redeploy LibreChat (app only)
+
+# Use this when you just want to pull the latest LibreChat image / re-sync
+# librechat.yaml or nginx.conf, without touching the OCI infrastructure.
+on:
+  workflow_dispatch: {}
+  # Uncomment to also refresh automatically (picks up new :latest images and
+  # security fixes on a schedule):
+  # schedule:
+  #   - cron: '0 18 * * 0' # every Sunday 03:00 JST
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Read instance IP from Terraform state
+        id: tf
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=librechat/terraform.tfstate" \
+            -backend-config="region=${{ secrets.OCI_REGION }}" \
+            -backend-config="endpoint=https://${{ secrets.TF_STATE_NAMESPACE }}.compat.objectstorage.${{ secrets.OCI_REGION }}.oraclecloud.com" \
+            -backend-config="access_key=${{ secrets.TF_STATE_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.TF_STATE_SECRET_KEY }}" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="force_path_style=true"
+          echo "ip=$(terraform output -raw instance_public_ip)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ steps.tf.outputs.ip }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Determine public URL
+        id: url
+        run: |
+          if [ -n "${{ secrets.DOMAIN_NAME }}" ]; then
+            echo "base_url=https://${{ secrets.DOMAIN_NAME }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_url=http://${{ steps.tf.outputs.ip }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare LibreChat config files
+        run: |
+          [ -f librechat.yaml ] || cp librechat.example.yaml librechat.yaml
+          cat > .env <<'ENVEOF'
+          HOST=0.0.0.0
+          PORT=3080
+          APP_TITLE=LibreChat
+          DOMAIN_CLIENT=${{ steps.url.outputs.base_url }}
+          DOMAIN_SERVER=${{ steps.url.outputs.base_url }}
+          NO_INDEX=true
+          TRUST_PROXY=1
+          MONGO_URI=mongodb://mongodb:27017/LibreChat
+          JWT_SECRET=${{ secrets.LIBRECHAT_JWT_SECRET }}
+          JWT_REFRESH_SECRET=${{ secrets.LIBRECHAT_JWT_REFRESH_SECRET }}
+          SESSION_EXPIRY=1000 * 60 * 15
+          REFRESH_TOKEN_EXPIRY=(1000 * 60 * 60 * 24) * 7
+          CREDS_KEY=${{ secrets.LIBRECHAT_CREDS_KEY }}
+          CREDS_IV=${{ secrets.LIBRECHAT_CREDS_IV }}
+          SEARCH=true
+          MEILI_NO_ANALYTICS=true
+          MEILI_HOST=http://meilisearch:7700
+          MEILI_MASTER_KEY=${{ secrets.LIBRECHAT_MEILI_MASTER_KEY }}
+          RAG_PORT=8000
+          ALLOW_EMAIL_LOGIN=true
+          ALLOW_REGISTRATION=true
+          ALLOW_SOCIAL_LOGIN=false
+          ALLOW_PASSWORD_RESET=false
+          ALLOW_UNVERIFIED_EMAIL_LOGIN=true
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY || 'user_provided' }}
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY || 'user_provided' }}
+          GOOGLE_KEY=${{ secrets.GOOGLE_KEY || 'user_provided' }}
+          ENVEOF
+
+      - name: Sync files and restart
+        env:
+          HOST: ${{ steps.tf.outputs.ip }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ubuntu@"$HOST" 'mkdir -p /opt/librechat/client'
+          scp -i ~/.ssh/id_ed25519 deploy-compose.yml ubuntu@"$HOST":/opt/librechat/deploy-compose.yml
+          scp -i ~/.ssh/id_ed25519 .env ubuntu@"$HOST":/opt/librechat/.env
+          scp -i ~/.ssh/id_ed25519 librechat.yaml ubuntu@"$HOST":/opt/librechat/librechat.yaml
+          scp -i ~/.ssh/id_ed25519 client/nginx.conf ubuntu@"$HOST":/opt/librechat/client/nginx.conf
+          ssh -i ~/.ssh/id_ed25519 ubuntu@"$HOST" '
+            cd /opt/librechat &&
+            chmod 600 .env &&
+            docker compose -f deploy-compose.yml pull &&
+            docker compose -f deploy-compose.yml up -d
+          '
+
+      - name: Wait for LibreChat to respond
+        env:
+          HOST: ${{ steps.tf.outputs.ip }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "http://$HOST"; then
+              echo "LibreChat is up: http://$HOST"
+              exit 0
+            fi
+            echo "Waiting for LibreChat to come up... ($i/30)"
+            sleep 15
+          done
+          echo "Did not respond in time. Check logs with:" >&2
+          echo "  ssh ubuntu@$HOST 'cd /opt/librechat && docker compose -f deploy-compose.yml logs'" >&2
+          exit 1
