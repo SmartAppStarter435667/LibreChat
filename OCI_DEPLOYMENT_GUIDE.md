@@ -89,6 +89,30 @@ action=apply）するのが確実です。
 初回はイメージのpull(6コンテナ分)に数分かかります。ワークフローの最後で
 自動的に疎通確認するので、緑色になれば起動完了です。
 
+## 必要な GitHub Secrets 一覧
+
+`scripts/oci-setup-secrets.sh` を実行すると以下18個が自動設定されます。
+`gh secret list --repo <owner>/<repo>` でこれが揃っているか確認できます
+(値は表示されず名前だけ出ます)。1つでも足りなければワークフローは失敗します。
+
+| Secret名 | 内容 |
+|---|---|
+| `OCI_TENANCY_OCID` | OCIテナンシOCID |
+| `OCI_USER_OCID` | OCIユーザーOCID |
+| `OCI_FINGERPRINT` | APIキーのフィンガープリント |
+| `OCI_PRIVATE_KEY` | APIキー(PEM)本文 |
+| `OCI_REGION` | 例: ap-tokyo-1 |
+| `OCI_COMPARTMENT_OCID` | デプロイ先コンパートメントOCID |
+| `SSH_PRIVATE_KEY` / `SSH_PUBLIC_KEY` | インスタンス用SSH鍵 |
+| `SSH_ALLOWED_CIDR` | SSH許可元CIDR |
+| `LIBRECHAT_JWT_SECRET` / `LIBRECHAT_JWT_REFRESH_SECRET` | LibreChat認証用 |
+| `LIBRECHAT_CREDS_KEY` / `LIBRECHAT_CREDS_IV` | LibreChat暗号化用 |
+| `LIBRECHAT_MEILI_MASTER_KEY` | Meilisearch用 |
+| `TF_STATE_BUCKET` | Terraform state用バケット名 |
+| `TF_STATE_NAMESPACE` | Object Storageネームスペース |
+| `TF_STATE_ACCESS_KEY` / `TF_STATE_SECRET_KEY` | state用 Customer Secret Key |
+| `DOMAIN_NAME`(任意) | 独自ドメイン |
+
 ## 日常の運用
 
 - **LibreChat だけ更新したい**（最新の `:latest` イメージ、`librechat.yaml` の変更など)
@@ -121,8 +145,45 @@ action=apply）するのが確実です。
 
 ## トラブルシューティング
 
+### terraform init が「region」や「bucket」が空というエラーで失敗する
+
+```
+Error: Invalid Value / Missing region value
+```
+
+`TF_VAR_*` や `-backend-config` の値が軒並み空の場合、原因は100%
+「このリポジトリに GitHub Secrets が設定されていない」ことです。よくある原因:
+
+1. `scripts/oci-setup-secrets.sh` をまだ実行していない
+2. 実行はしたが、**別のリポジトリを指すディレクトリ**から実行してしまった
+   (スクリプトは `gh repo view` でカレントディレクトリのリポジトリを自動検出するため)
+3. Secretsを手動でGitHub画面から登録した際、"Repository secrets" ではなく
+   "Environments" 配下に作ってしまった(ワークフロー側で `environment:` を
+   指定していないため見えません)
+
+対処:
+
 ```bash
-# サーバーにSSHして状態を見る
+# 対象リポジトリにSecretsが揃っているか確認(上の一覧と照合)
+gh secret list --repo <owner>/<repo>
+
+# 不足していれば、このリポジトリのクローン内で実行し直す
+git clone https://github.com/<owner>/<repo>.git
+cd <repo>
+oci setup config          # 未設定なら先にこちらを済ませる
+gh auth login              # 未ログインなら
+./scripts/oci-setup-secrets.sh
+```
+
+実行後にエラーなく完了し、`gh secret list` で18個揃っていることを確認してから、
+Actions タブでワークフローを再実行してください。
+
+なお `Warning: Deprecated Parameter ... "endpoint" ... use "endpoints.s3"` は
+警告のみでビルドを止める原因ではないため、上記を解消すれば無視して問題ありません。
+
+### サーバーにログインして状態を見る
+
+```bash
 ssh -i .secrets/librechat_oci_ed25519 ubuntu@<IP>
 
 # コンテナのログ
